@@ -1,0 +1,988 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADB Remote</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234f8cff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='20' height='15' x='2' y='7' rx='2'/%3E%3Cpath d='m17 2-5 5-5-5'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #0c0e11;
+  --panel: #14171c;
+  --panel-2: #1b1f26;
+  --panel-3: #232833;
+  --line: #262c36;
+  --text: #e7e9ec;
+  --muted: #8a919c;
+  --accent: #4f8cff;
+  --accent-soft: rgba(79, 140, 255, .14);
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, .12);
+  --radius: 12px;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+button { font: inherit; color: inherit; }
+svg.i { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+/* ---------- header ---------- */
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  flex: none;
+}
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; white-space: nowrap; }
+.brand svg { color: var(--accent); }
+form.connect { display: flex; gap: 0; flex: none; }
+form.connect input {
+  width: 200px; height: 34px; padding: 0 12px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-right: 0; border-radius: 8px 0 0 8px;
+  font: inherit; outline: none;
+}
+form.connect input:focus { border-color: var(--accent); }
+form.connect button {
+  height: 34px; padding: 0 14px; border: 0; border-radius: 0 8px 8px 0;
+  background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+form.connect button:disabled { opacity: .6; cursor: default; }
+.chips { display: flex; gap: 8px; overflow-x: auto; flex: 1; min-width: 0; scrollbar-width: none; }
+.chips::-webkit-scrollbar { display: none; }
+.chip {
+  display: flex; align-items: center; gap: 8px;
+  height: 34px; padding: 0 6px 0 12px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  cursor: pointer; white-space: nowrap; flex: none;
+}
+.chip:hover { border-color: #3a4250; }
+.chip.active { border-color: var(--accent); background: var(--accent-soft); }
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.chip .dot.device { background: var(--ok); }
+.chip .dot.unauthorized { background: var(--warn); }
+.chip .sub { color: var(--muted); font-size: 12px; }
+.chip .x { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 6px; background: none; color: var(--muted); cursor: pointer; }
+.chip .x:hover { background: var(--panel-3); color: var(--text); }
+.chip .x svg { width: 14px; height: 14px; }
+.chip .x + .x { margin-left: -6px; }
+.icon-btn {
+  display: grid; place-items: center; width: 34px; height: 34px; flex: none;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); cursor: pointer;
+}
+.icon-btn:hover { color: var(--text); border-color: #3a4250; }
+.icon-btn svg { width: 18px; height: 18px; }
+select.quality {
+  height: 34px; padding: 0 10px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; font: inherit; flex: none; outline: none;
+}
+
+/* ---------- layout ---------- */
+main { flex: 1; display: flex; min-height: 0; }
+aside.remote {
+  width: 300px; flex: none; overflow-y: auto;
+  padding: 16px; display: flex; flex-direction: column; gap: 14px;
+  background: var(--panel); border-right: 1px solid var(--line);
+}
+aside.remote > * { flex: none; }
+.stage { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.screen { position: relative; flex: 1; min-height: 0; outline: none; touch-action: none; user-select: none; }
+.screen-inner { position: absolute; inset: 12px; display: flex; align-items: center; justify-content: center; }
+.screen canvas, .screen video {
+  max-width: 100%; max-height: 100%; display: block;
+  border-radius: 6px; background: #000;
+  box-shadow: 0 0 0 1px var(--line), 0 12px 40px rgba(0,0,0,.5);
+}
+.screen:focus-visible canvas, .screen:focus-visible video,
+.screen.focused canvas, .screen.focused video { box-shadow: 0 0 0 1px var(--accent), 0 12px 40px rgba(0,0,0,.5); }
+.overlay {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+  color: var(--muted);
+}
+.overlay svg.big { width: 56px; height: 56px; stroke-width: 1.5; opacity: .5; }
+.overlay .msg { max-width: 460px; text-align: center; white-space: pre-wrap; word-break: break-word; }
+.overlay .msg.err { color: var(--danger); }
+.overlay button {
+  height: 34px; padding: 0 18px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel-2); cursor: pointer;
+}
+.overlay button:hover { border-color: var(--accent); }
+.spinner { width: 34px; height: 34px; border: 3px solid var(--panel-3); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.statusbar {
+  flex: none; display: flex; gap: 16px; align-items: center;
+  height: 32px; padding: 0 16px; border-top: 1px solid var(--line);
+  color: var(--muted); font-size: 12px; background: var(--panel);
+  font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
+}
+.statusbar b { color: var(--text); font-weight: 500; }
+.statusbar .sp { flex: 1; }
+
+/* ---------- remote ---------- */
+.group { display: flex; flex-direction: column; gap: 8px; }
+.group h3 { margin: 0; font-size: 12px; font-weight: 500; color: var(--muted); letter-spacing: .04em; }
+.row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.row.two { grid-template-columns: 1fr 1fr; }
+.btn {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  height: 56px; padding: 0 4px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+  cursor: pointer; touch-action: manipulation; user-select: none;
+  transition: background .12s, border-color .12s, transform .06s;
+}
+.btn span { font-size: 12px; color: var(--muted); }
+.btn:hover { background: var(--panel-3); border-color: #353c48; }
+.btn.pressed, .btn:active { transform: scale(.96); border-color: var(--accent); background: var(--accent-soft); }
+.btn.on { border-color: var(--accent); color: var(--accent); }
+.btn.danger { color: var(--danger); }
+.btn.danger:hover { background: var(--danger-soft); border-color: rgba(248,113,113,.4); }
+.btn.slim { height: 44px; flex-direction: row; gap: 6px; }
+.btn.slim span { font-size: 13px; color: inherit; }
+
+.top-row { display: flex; justify-content: space-between; }
+.round {
+  width: 52px; height: 52px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--panel-2); border: 1px solid var(--line); cursor: pointer;
+  touch-action: manipulation; user-select: none;
+  transition: background .12s, border-color .12s, transform .06s;
+}
+.round:hover { background: var(--panel-3); }
+.round.pressed, .round:active { transform: scale(.94); }
+.round.power { color: var(--danger); }
+.round.power:hover { background: var(--danger-soft); }
+.round.on { color: var(--accent); border-color: var(--accent); }
+
+.dpad { position: relative; width: 200px; height: 200px; margin: 4px auto; border-radius: 50%; background: var(--panel-2); border: 1px solid var(--line); }
+.dpad .d {
+  position: absolute; display: grid; place-items: center;
+  border: 0; background: none; color: var(--muted); cursor: pointer; border-radius: 12px;
+  touch-action: manipulation; user-select: none;
+}
+.dpad .d:hover { color: var(--text); background: var(--panel-3); }
+.dpad .d.pressed { color: var(--accent); background: var(--accent-soft); }
+.dpad .d svg { width: 26px; height: 26px; }
+.dpad .up    { left: 66px; top: 6px; width: 68px; height: 56px; }
+.dpad .down  { left: 66px; bottom: 6px; width: 68px; height: 56px; }
+.dpad .left  { top: 66px; left: 6px; width: 56px; height: 68px; }
+.dpad .right { top: 66px; right: 6px; width: 56px; height: 68px; }
+.dpad .ok {
+  left: 64px; top: 64px; width: 72px; height: 72px; border-radius: 50%;
+  background: var(--panel-3); border: 1px solid #3a4250; color: var(--text); font-weight: 600; letter-spacing: .05em;
+}
+.dpad .ok:hover { border-color: var(--accent); background: var(--panel-3); }
+.dpad .ok.pressed { background: var(--accent); color: #fff; }
+
+.textbox { display: flex; gap: 8px; }
+.textbox input {
+  flex: 1; min-width: 0; height: 40px; padding: 0 12px;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px; font: inherit; outline: none;
+}
+.textbox input:focus { border-color: var(--accent); }
+.textbox button { width: 44px; height: 40px; display: grid; place-items: center; background: var(--accent); color: #fff; border: 0; border-radius: 10px; cursor: pointer; }
+
+/* ---------- toast / dialog ---------- */
+.toasts { position: fixed; right: 16px; bottom: 44px; display: flex; flex-direction: column; gap: 8px; z-index: 30; pointer-events: none; }
+.toast {
+  max-width: 360px; padding: 10px 14px; border-radius: 10px;
+  background: var(--panel-3); border: 1px solid var(--line); box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  white-space: pre-wrap; word-break: break-word; animation: pop .15s ease-out;
+}
+.toast.err { border-color: rgba(248,113,113,.5); }
+.toast.ok { border-color: rgba(52,211,153,.5); }
+@keyframes pop { from { opacity: 0; transform: translateY(6px); } }
+dialog {
+  background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 20px; width: min(340px, calc(100vw - 32px));
+}
+dialog::backdrop { background: rgba(0,0,0,.55); }
+dialog p { margin: 0 0 18px; font-size: 15px; }
+dialog .acts { display: flex; justify-content: flex-end; gap: 8px; }
+dialog button { height: 34px; padding: 0 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer; }
+dialog button.go { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
+dialog button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+dialog h4 { margin: 0 0 16px; font-size: 15px; font-weight: 600; }
+dialog label { display: block; margin-bottom: 12px; font-size: 12px; color: var(--muted); }
+dialog input {
+  display: block; width: 100%; height: 36px; margin-top: 6px; padding: 0 12px;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: inherit; outline: none;
+}
+dialog input:focus { border-color: var(--accent); }
+dialog form .acts { margin-top: 18px; }
+
+.disabled-area { opacity: .45; pointer-events: none; }
+
+@media (max-width: 760px) {
+  body { overflow: auto; height: auto; }
+  header { flex-wrap: wrap; }
+  form.connect { flex: 1; }
+  form.connect input { flex: 1; width: auto; min-width: 0; }
+  .chips { order: 3; flex-basis: 100%; }
+  main { flex-direction: column-reverse; }
+  aside.remote { width: auto; border-right: 0; border-top: 1px solid var(--line); overflow: visible; }
+  .stage { flex: none; }
+  .screen { flex: none; aspect-ratio: var(--ar, 16 / 9); max-height: 75vh; }
+  .screen-inner { inset: 8px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><svg class="i"><use href="#i-tv"/></svg>ADB Remote</div>
+  <form class="connect" id="connectForm" autocomplete="off">
+    <input id="addr" placeholder="设备 IP" spellcheck="false">
+    <button id="connectBtn">连接</button>
+  </form>
+  <button class="icon-btn" id="saveBtn" title="保存设备"><svg class="i"><use href="#i-bookmark"/></svg></button>
+  <div class="chips" id="chips"></div>
+  <select class="quality" id="quality">
+    <option value="720,2000000,30">流畅</option>
+    <option value="1280,4000000,30" selected>高清</option>
+    <option value="1920,8000000,60">超清</option>
+    <option value="0,16000000,60">原画</option>
+  </select>
+</header>
+
+<main>
+  <aside class="remote" id="remote">
+    <div class="top-row">
+      <div class="round power" data-key="26" title="电源"><svg class="i"><use href="#i-power"/></svg></div>
+      <div class="round" id="displayBtn" title="熄屏投屏"><svg class="i"><use href="#i-monitor-off"/></svg></div>
+    </div>
+
+    <div class="dpad">
+      <button class="d up" data-key="19" data-repeat><svg class="i"><use href="#i-up"/></svg></button>
+      <button class="d left" data-key="21" data-repeat><svg class="i"><use href="#i-left"/></svg></button>
+      <button class="d ok" data-key="23">OK</button>
+      <button class="d right" data-key="22" data-repeat><svg class="i"><use href="#i-right"/></svg></button>
+      <button class="d down" data-key="20" data-repeat><svg class="i"><use href="#i-down"/></svg></button>
+    </div>
+
+    <div class="row">
+      <div class="btn" data-key="4"><svg class="i"><use href="#i-back"/></svg><span>返回</span></div>
+      <div class="btn" data-key="3"><svg class="i"><use href="#i-home"/></svg><span>主页</span></div>
+      <div class="btn" data-key="82"><svg class="i"><use href="#i-menu"/></svg><span>菜单</span></div>
+    </div>
+    <div class="row">
+      <div class="btn" data-key="187"><svg class="i"><use href="#i-apps"/></svg><span>多任务</span></div>
+      <div class="btn" data-ctl="5"><svg class="i"><use href="#i-bell"/></svg><span>通知</span></div>
+      <div class="btn" data-key="176"><svg class="i"><use href="#i-settings"/></svg><span>设置</span></div>
+    </div>
+
+    <div class="group">
+      <h3>音量</h3>
+      <div class="row">
+        <div class="btn" data-key="25" data-repeat><svg class="i"><use href="#i-vol-down"/></svg><span>音量 −</span></div>
+        <div class="btn" data-key="164"><svg class="i"><use href="#i-mute"/></svg><span>静音</span></div>
+        <div class="btn" data-key="24" data-repeat><svg class="i"><use href="#i-vol-up"/></svg><span>音量 +</span></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>媒体</h3>
+      <div class="row">
+        <div class="btn" data-key="88"><svg class="i"><use href="#i-prev"/></svg><span>上一个</span></div>
+        <div class="btn" data-key="85"><svg class="i"><use href="#i-playpause"/></svg><span>播放/暂停</span></div>
+        <div class="btn" data-key="87"><svg class="i"><use href="#i-next"/></svg><span>下一个</span></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>输入</h3>
+      <form class="textbox" id="textForm" autocomplete="off">
+        <input id="textInput">
+        <button title="发送"><svg class="i"><use href="#i-send"/></svg></button>
+      </form>
+    </div>
+
+    <div class="group">
+      <h3>系统</h3>
+      <div class="row two">
+        <div class="btn slim" id="shotBtn"><svg class="i"><use href="#i-camera"/></svg><span>截图</span></div>
+        <div class="btn slim" id="installBtn"><svg class="i"><use href="#i-download"/></svg><span>安装 APK</span></div>
+        <div class="btn slim" data-ctl="11"><svg class="i"><use href="#i-rotate"/></svg><span>旋转</span></div>
+        <div class="btn slim" id="rebootBtn"><svg class="i"><use href="#i-reboot"/></svg><span>重启</span></div>
+      </div>
+      <div class="btn slim danger" id="shutdownBtn"><svg class="i"><use href="#i-power"/></svg><span>关机</span></div>
+    </div>
+    <input type="file" id="apkFile" accept=".apk" hidden>
+  </aside>
+
+  <section class="stage">
+    <div class="screen" id="screen" tabindex="0">
+      <div class="screen-inner">
+        <canvas id="canvas" hidden></canvas>
+        <video id="video" muted autoplay playsinline hidden></video>
+      </div>
+      <div class="overlay" id="overlay"></div>
+    </div>
+    <div class="statusbar" id="statusbar"></div>
+  </section>
+</main>
+
+<div class="toasts" id="toasts"></div>
+<dialog id="deviceDlg">
+  <form id="deviceForm" autocomplete="off">
+    <h4 id="deviceTitle">保存设备</h4>
+    <label>IP 地址<input id="devAddr" spellcheck="false" required></label>
+    <label>名称<input id="devName" maxlength="40"></label>
+    <div class="acts"><button type="button" id="devCancel">取消</button><button class="primary">保存</button></div>
+  </form>
+</dialog>
+<dialog id="confirmDlg"><p id="confirmText"></p><div class="acts"><button value="no" id="confirmNo">取消</button><button class="go" id="confirmYes">确定</button></div></dialog>
+
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="i-tv" viewBox="0 0 24 24"><rect width="20" height="15" x="2" y="7" rx="2"/><path d="m17 2-5 5-5-5"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></symbol>
+  <symbol id="i-monitor-off" viewBox="0 0 24 24"><path d="M17 17H4a2 2 0 0 1-2-2V5c0-1.5 1-2 1-2"/><path d="M22 15V5a2 2 0 0 0-2-2H9"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="m2 2 20 20"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4"/></symbol>
+  <symbol id="i-vol-down" viewBox="0 0 24 24"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/></symbol>
+  <symbol id="i-vol-up" viewBox="0 0 24 24"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/></symbol>
+  <symbol id="i-mute" viewBox="0 0 24 24"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="m22 9-6 6M16 9l6 6"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path d="M17.971 4.285A2 2 0 0 1 21 6v12a2 2 0 0 1-3.029 1.715l-9.997-5.998a2 2 0 0 1-.003-3.432z"/><path d="M3 20V4"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M21 4v16"/><path d="M6.029 4.285A2 2 0 0 0 3 6v12a2 2 0 0 0 3.029 1.715l9.997-5.998a2 2 0 0 0 .003-3.432z"/></symbol>
+  <symbol id="i-playpause" viewBox="0 0 24 24"><path d="M4 5v14l8-7z"/><path d="M16 5v14M20 5v14"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/></symbol>
+  <symbol id="i-rotate" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol>
+  <symbol id="i-reboot" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2Z"/><path d="M12 7v6M9 10h6"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect width="14" height="20" x="5" y="2" rx="2"/><path d="M12 18h.01"/></symbol>
+</svg>
+
+<script src="/static/vendor/jmuxer.min.js"></script>
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// ------------------------------------------------------------ scrcpy control messages
+const enc = new TextEncoder();
+const Msg = {
+  key(action, code, repeat = 0, meta = 0) {
+    const b = new DataView(new ArrayBuffer(14));
+    b.setUint8(0, 0); b.setUint8(1, action); b.setInt32(2, code); b.setInt32(6, repeat); b.setInt32(10, meta);
+    return b.buffer;
+  },
+  text(s) {
+    const t = enc.encode(s).slice(0, 300);
+    const b = new Uint8Array(5 + t.length); const v = new DataView(b.buffer);
+    v.setUint8(0, 1); v.setUint32(1, t.length); b.set(t, 5);
+    return b.buffer;
+  },
+  touch(action, pointerId, x, y, w, h, pressure) {
+    const b = new DataView(new ArrayBuffer(32));
+    b.setUint8(0, 2); b.setUint8(1, action); b.setBigInt64(2, pointerId);
+    b.setInt32(10, x); b.setInt32(14, y); b.setUint16(18, w); b.setUint16(20, h);
+    b.setUint16(22, pressure ? 0xffff : 0); b.setInt32(24, 0); b.setInt32(28, 0);
+    return b.buffer;
+  },
+  scroll(x, y, w, h, hs, vs) {
+    const fp = f => Math.max(-0x8000, Math.min(0x7fff, Math.round(Math.max(-1, Math.min(1, f / 16)) * 0x8000)));
+    const b = new DataView(new ArrayBuffer(21));
+    b.setUint8(0, 3); b.setInt32(1, x); b.setInt32(5, y); b.setUint16(9, w); b.setUint16(11, h);
+    b.setInt16(13, fp(hs)); b.setInt16(15, fp(vs)); b.setInt32(17, 0);
+    return b.buffer;
+  },
+  backOrScreenOn(action) { return new Uint8Array([4, action]).buffer; },
+  simple(type) { return new Uint8Array([type]).buffer; },
+  displayPower(on) { return new Uint8Array([10, on ? 1 : 0]).buffer; },
+  clipboard(s, paste) {
+    const t = enc.encode(s);
+    const b = new Uint8Array(14 + t.length); const v = new DataView(b.buffer);
+    v.setUint8(0, 9); v.setBigInt64(1, 0n); v.setUint8(9, paste ? 1 : 0); v.setUint32(10, t.length); b.set(t, 14);
+    return b.buffer;
+  },
+};
+
+// ------------------------------------------------------------ H.264 helpers
+function nalUnits(data) {
+  const out = [];
+  let i = 0, start = -1;
+  while (i + 3 <= data.length) {
+    if (data[i] === 0 && data[i + 1] === 0 && (data[i + 2] === 1 || (data[i + 2] === 0 && data[i + 3] === 1))) {
+      if (start >= 0) out.push(data.subarray(start, i));
+      i += data[i + 2] === 1 ? 3 : 4;
+      start = i;
+    } else i++;
+  }
+  if (start >= 0) out.push(data.subarray(start));
+  return out;
+}
+function findSps(config) {
+  return nalUnits(config).find(n => (n[0] & 0x1f) === 7);
+}
+function codecString(sps) {
+  const h = n => n.toString(16).padStart(2, '0');
+  return sps ? `avc1.${h(sps[1])}${h(sps[2])}${h(sps[3])}` : 'avc1.42e01f';
+}
+function concat(a, b) {
+  const r = new Uint8Array(a.length + b.length); r.set(a, 0); r.set(b, a.length); return r;
+}
+
+// WebCodecs (secure context) — lowest latency
+class WebCodecsPlayer {
+  constructor(canvas, onFrame, onBroken) {
+    this.canvas = canvas; this.ctx = canvas.getContext('2d');
+    this.onFrame = onFrame; this.onBroken = onBroken;
+    this.dec = null; this.cfg = null; this.needKey = true;
+  }
+  el() { return this.canvas; }
+  config(data) {
+    this.cfg = data.slice();
+    if (!this.dec || this.dec.state === 'closed') {
+      this.dec = new VideoDecoder({
+        output: f => {
+          if (this.canvas.width !== f.displayWidth || this.canvas.height !== f.displayHeight) {
+            this.canvas.width = f.displayWidth; this.canvas.height = f.displayHeight;
+          }
+          this.ctx.drawImage(f, 0, 0);
+          this.onFrame(f.displayWidth, f.displayHeight);
+          f.close();
+        },
+        error: e => { console.warn('decoder', e); this.onBroken(); },
+      });
+    }
+    this.dec.configure({ codec: codecString(findSps(this.cfg)), optimizeForLatency: true });
+    this.needKey = true;
+  }
+  frame(data, key, pts) {
+    if (!this.dec || this.dec.state !== 'configured') return;
+    if (this.needKey && !key) return;
+    this.needKey = false;
+    try {
+      this.dec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: pts, data: key && this.cfg ? concat(this.cfg, data) : data }));
+    } catch (e) { console.warn(e); this.onBroken(); }
+  }
+  destroy() { try { this.dec && this.dec.state !== 'closed' && this.dec.close(); } catch {} this.dec = null; }
+}
+
+// MSE via JMuxer — works over plain http on a LAN IP
+class MsePlayer {
+  constructor(video, fps, onFrame, onBroken) {
+    this.video = video; this.fps = fps; this.onFrame = onFrame; this.onBroken = onBroken;
+    this.jm = null; this.sps = ''; this.cfg = null; this.needKey = true;
+    this.onResize = () => video.videoWidth && onFrame(video.videoWidth, video.videoHeight, true);
+    video.addEventListener('resize', this.onResize);
+    this.timer = setInterval(() => this.chase(), 200);
+  }
+  el() { return this.video; }
+  chase() {
+    const v = this.video;
+    if (!v.buffered.length) return;
+    const end = v.buffered.end(v.buffered.length - 1);
+    if (end - v.currentTime > 0.25) v.currentTime = Math.max(v.buffered.start(v.buffered.length - 1), end - 0.03);
+    if (v.paused) v.play().catch(() => {});
+  }
+  config(data) {
+    const sps = Array.from(findSps(data) || []).join(',');
+    if (this.jm && sps !== this.sps) { this.jm.destroy(); this.jm = null; }
+    this.sps = sps;
+    if (!this.jm) {
+      this.jm = new JMuxer({ node: this.video, mode: 'video', flushingTime: 0, fps: this.fps, debug: false, onError: () => this.onBroken() });
+    }
+    this.cfg = data.slice();
+    this.needKey = true;
+  }
+  frame(data, key) {
+    if (!this.jm || (this.needKey && !key)) return;
+    this.needKey = false;
+    this.jm.feed({ video: key && this.cfg ? concat(this.cfg, data) : data.slice() });
+    this.onFrame();
+  }
+  destroy() {
+    clearInterval(this.timer);
+    this.video.removeEventListener('resize', this.onResize);
+    try { this.jm && this.jm.destroy(); } catch {}
+    this.jm = null;
+    this.video.removeAttribute('src'); this.video.load();
+  }
+}
+
+const useWebCodecs = 'VideoDecoder' in window && !new URLSearchParams(location.search).has('mse');
+
+// ------------------------------------------------------------ state
+const state = {
+  devices: [],
+  serial: store.get('serial') || '',
+  ws: null,
+  player: null,
+  w: 0, h: 0,
+  streaming: false,
+  displayOff: false,
+  frames: 0, fps: 0,
+  name: '', info: null,
+};
+
+// ------------------------------------------------------------ UI helpers
+function toast(text, kind = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind; el.textContent = text;
+  $('#toasts').appendChild(el);
+  setTimeout(() => el.remove(), kind === 'err' ? 6000 : 3000);
+}
+function confirmBox(text) {
+  const dlg = $('#confirmDlg');
+  $('#confirmText').textContent = text;
+  dlg.showModal();
+  return new Promise(res => {
+    const done = v => { dlg.close(); $('#confirmYes').onclick = $('#confirmNo').onclick = null; res(v); };
+    $('#confirmYes').onclick = () => done(true);
+    $('#confirmNo').onclick = () => done(false);
+    dlg.oncancel = () => done(false);
+  });
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  return r.json();
+}
+function overlay(kind, text = '') {
+  const o = $('#overlay');
+  if (kind === 'none') { o.innerHTML = ''; o.hidden = true; return; }
+  o.hidden = false;
+  if (kind === 'empty') o.innerHTML = `<svg class="i big"><use href="#i-phone"/></svg>`;
+  else if (kind === 'loading') o.innerHTML = `<div class="spinner"></div>${text ? `<div class="msg">${esc(text)}</div>` : ''}`;
+  else if (kind === 'error') {
+    o.innerHTML = `<svg class="i big"><use href="#i-phone"/></svg><div class="msg err">${esc(text)}</div><button id="retryBtn">重新连接</button>`;
+    $('#retryBtn').onclick = () => selectDevice(state.serial, true);
+  }
+}
+function renderStatus() {
+  const d = state.devices.find(x => x.serial === state.serial);
+  if (!state.serial) { $('#statusbar').innerHTML = ''; return; }
+  const left = [`<b>${esc(d?.name || state.name || d?.model || state.serial)}</b>`];
+  if (state.info?.android) left.push(`Android ${esc(state.info.android)}`);
+  if (+state.info?.battery > 0) left.push(`电量 ${esc(state.info.battery)}%`);
+  const right = state.streaming && state.w ? [`${state.w}×${state.h}`, `${state.fps} fps`] : [];
+  right.push(esc(state.serial));
+  $('#statusbar').innerHTML = `${left.join('<span>·</span>')}<span class="sp"></span>${right.join('<span>·</span>')}`;
+}
+function deviceLabel(d) { return d.name || d.model || d.serial; }
+function renderChips() {
+  const stateText = { device: '', unauthorized: '待授权', offline: '离线' };
+  $('#chips').innerHTML = state.devices.map(d => `
+    <div class="chip ${d.serial === state.serial ? 'active' : ''}" data-serial="${esc(d.serial)}">
+      <span class="dot ${esc(d.state)}"></span>
+      <span>${esc(deviceLabel(d))}</span>
+      ${deviceLabel(d) !== d.serial ? `<span class="sub">${esc(d.serial)}</span>` : ''}
+      ${d.state !== 'device' ? `<span class="sub">${stateText[d.state] ?? esc(d.state)}</span>` : ''}
+      <button class="x" data-edit="${esc(d.serial)}" title="编辑"><svg class="i"><use href="#i-pencil"/></svg></button>
+      <button class="x" data-forget="${esc(d.serial)}" title="移除"><svg class="i"><use href="#i-x"/></svg></button>
+    </div>`).join('');
+}
+function setRemoteEnabled(on) { $('#remote').classList.toggle('disabled-area', !on); }
+
+// ------------------------------------------------------------ devices
+async function refreshDevices() {
+  try {
+    state.devices = await api('/api/devices');
+    renderChips(); renderStatus();
+  } catch (e) { console.warn(e); }
+}
+
+$('#connectForm').onsubmit = async e => {
+  e.preventDefault();
+  const addr = $('#addr').value.trim();
+  if (!addr) return;
+  const btn = $('#connectBtn'); btn.disabled = true;
+  try {
+    const r = await api('/api/connect', { addr });
+    if (!r.ok) { toast(r.message || '连接失败', 'err'); return; }
+    $('#addr').value = '';
+    await refreshDevices();
+    selectDevice(r.serial, true);
+  } catch (err) { toast(err.message, 'err'); }
+  finally { btn.disabled = false; }
+};
+
+function deviceDialog(d) {
+  const dlg = $('#deviceDlg');
+  $('#deviceTitle').textContent = d ? '编辑设备' : '保存设备';
+  $('#devAddr').value = d ? d.serial : $('#addr').value.trim();
+  $('#devName').value = d ? (d.name || '') : '';
+  $('#devCancel').onclick = () => dlg.close();
+  $('#deviceForm').onsubmit = async e => {
+    e.preventDefault();
+    try {
+      const r = await api('/api/save', { addr: $('#devAddr').value, name: $('#devName').value, old: d ? d.serial : '' });
+      dlg.close();
+      if (!d) $('#addr').value = '';
+      if (d && d.serial === state.serial && r.serial !== d.serial) {
+        stopStream(); state.serial = r.serial; store.set('serial', r.serial); overlay('empty');
+      }
+      await refreshDevices();
+    } catch (err) { toast(err.message, 'err'); }
+  };
+  dlg.showModal();
+  (d || $('#devAddr').value ? $('#devName') : $('#devAddr')).focus();
+}
+$('#saveBtn').onclick = () => deviceDialog(null);
+
+$('#chips').onclick = async e => {
+  const edit = e.target.closest('[data-edit]');
+  if (edit) {
+    e.stopPropagation();
+    const d = state.devices.find(x => x.serial === edit.dataset.edit);
+    if (d) deviceDialog(d);
+    return;
+  }
+  const forget = e.target.closest('[data-forget]');
+  if (forget) {
+    e.stopPropagation();
+    const serial = forget.dataset.forget;
+    const d = state.devices.find(x => x.serial === serial);
+    if (!(await confirmBox(`移除 ${d ? deviceLabel(d) : serial}？`))) return;
+    await api('/api/forget', { serial }).catch(() => {});
+    if (serial === state.serial) { stopStream(); state.serial = ''; store.set('serial', ''); overlay('empty'); setRemoteEnabled(false); }
+    refreshDevices();
+    return;
+  }
+  const chip = e.target.closest('.chip');
+  if (chip) selectDevice(chip.dataset.serial, true);
+};
+
+async function selectDevice(serial, force) {
+  if (!serial) return;
+  if (serial === state.serial && state.streaming && !force) return;
+  stopStream();
+  state.serial = serial; store.set('serial', serial);
+  state.name = ''; state.info = null; state.w = state.h = 0;
+  renderChips(); renderStatus();
+  setRemoteEnabled(true);
+  overlay('loading', '');
+  let d = state.devices.find(x => x.serial === serial);
+  if (!d || d.state !== 'device') {
+    if (serial.includes(':')) {
+      try {
+        const r = await api('/api/connect', { addr: serial });
+        await refreshDevices();
+        if (serial !== state.serial) return;
+        if (!r.ok || r.state !== 'device') {
+          overlay('error', r.state === 'unauthorized' ? '设备未授权：请在设备屏幕上允许 USB 调试' : (r.message || '无法连接设备'));
+          return;
+        }
+      } catch (e) { overlay('error', e.message); return; }
+    } else { overlay('error', '设备离线'); return; }
+  }
+  api('/api/info?serial=' + encodeURIComponent(serial)).then(info => {
+    if (serial === state.serial && info.ok) { state.info = info; renderStatus(); }
+  }).catch(() => {});
+  startStream();
+}
+
+// ------------------------------------------------------------ stream
+function startStream() {
+  const [maxSize, bitRate, fps] = $('#quality').value.split(',');
+  const serial = state.serial;
+  const q = new URLSearchParams({ serial, max_size: maxSize, bit_rate: bitRate, max_fps: fps });
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?${q}`);
+  ws.binaryType = 'arraybuffer';
+  state.ws = ws;
+  overlay('loading', '');
+  let failed = false;
+
+  const onFrame = (w, h, fromResize) => {
+    if (w && h && (w !== state.w || h !== state.h)) { state.w = w; state.h = h; setAspect(); renderStatus(); }
+    if (!fromResize) state.frames++;
+    if (!state.streaming) {
+      state.streaming = true;
+      overlay('none');
+      state.player.el().hidden = false;
+      renderStatus();
+    }
+  };
+  const onBroken = () => {
+    if (state.ws !== ws) return;
+    state.player.destroy();
+    state.player = makePlayer(+fps, onFrame, onBroken);
+    send(Msg.simple(17)); // RESET_VIDEO: server re-sends config + key frame
+  };
+  state.player = makePlayer(+fps, onFrame, onBroken);
+
+  ws.onmessage = ev => {
+    if (state.ws !== ws) return;
+    if (typeof ev.data === 'string') {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'meta') { state.name = m.name; state.w = m.width; state.h = m.height; setAspect(); renderStatus(); }
+      else if (m.type === 'error') { failed = true; showStreamError(m.message); }
+      return;
+    }
+    const dv = new DataView(ev.data);
+    const hi = dv.getUint32(0), lo = dv.getUint32(4), size = dv.getUint32(8);
+    const data = new Uint8Array(ev.data, 12, size);
+    if (hi & 0x80000000) state.player.config(data);
+    else state.player.frame(data, !!(hi & 0x40000000), (hi & 0x3fffffff) * 4294967296 + lo);
+  };
+  ws.onclose = () => {
+    if (state.ws !== ws) return;
+    if (!failed) showStreamError(state.streaming ? '画面连接已断开' : '无法建立画面连接');
+  };
+}
+function setAspect() { document.documentElement.style.setProperty('--ar', `${state.w} / ${state.h}`); fitScreen(); }
+function fitScreen() {
+  const inner = $('.screen-inner').getBoundingClientRect();
+  if (!state.w || !inner.width) return;
+  const k = Math.min(inner.width / state.w, inner.height / state.h);
+  for (const el of [$('#canvas'), $('#video')]) {
+    el.style.width = Math.floor(state.w * k) + 'px';
+    el.style.height = Math.floor(state.h * k) + 'px';
+  }
+}
+new ResizeObserver(fitScreen).observe($('.screen-inner'));
+function makePlayer(fps, onFrame, onBroken) {
+  return useWebCodecs ? new WebCodecsPlayer($('#canvas'), onFrame, onBroken) : new MsePlayer($('#video'), fps, onFrame, onBroken);
+}
+function showStreamError(msg) {
+  stopStream();
+  overlay('error', msg);
+  refreshDevices();
+}
+function stopStream() {
+  const ws = state.ws;
+  state.ws = null;
+  if (ws) { ws.onclose = null; ws.close(); }
+  if (state.player) { state.player.destroy(); state.player = null; }
+  state.streaming = false;
+  state.displayOff = false; $('#displayBtn').classList.remove('on');
+  $('#canvas').hidden = true; $('#video').hidden = true;
+  renderStatus();
+}
+function send(buf) {
+  if (state.ws && state.ws.readyState === 1 && state.streaming) { state.ws.send(buf); return true; }
+  return false;
+}
+setInterval(() => {
+  if (state.streaming) { state.fps = state.frames; state.frames = 0; renderStatus(); }
+}, 1000);
+$('#quality').onchange = () => { if (state.serial) selectDevice(state.serial, true); };
+
+// ------------------------------------------------------------ screen input
+const screen = $('#screen');
+const pointers = new Map();
+function toDevice(e) {
+  const el = state.player?.el();
+  if (!el || !state.w) return null;
+  const r = el.getBoundingClientRect();
+  const s = Math.min(r.width / state.w, r.height / state.h);
+  const ox = r.left + (r.width - state.w * s) / 2, oy = r.top + (r.height - state.h * s) / 2;
+  const x = Math.round((e.clientX - ox) / s), y = Math.round((e.clientY - oy) / s);
+  return { x: Math.max(0, Math.min(state.w - 1, x)), y: Math.max(0, Math.min(state.h - 1, y)), inside: x >= 0 && y >= 0 && x < state.w && y < state.h };
+}
+function pointerId(e) { return e.pointerType === 'mouse' ? -2n : BigInt(e.pointerId); }
+
+screen.addEventListener('pointerdown', e => {
+  screen.focus({ preventScroll: true });
+  if (!state.streaming) return;
+  const p = toDevice(e);
+  if (!p || !p.inside) return;
+  e.preventDefault();
+  if (e.pointerType === 'mouse' && e.button === 2) { send(Msg.backOrScreenOn(0)); send(Msg.backOrScreenOn(1)); return; }
+  if (e.pointerType === 'mouse' && e.button === 1) { sendKey(3); return; }
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  screen.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, true);
+  send(Msg.touch(0, pointerId(e), p.x, p.y, state.w, state.h, true));
+});
+screen.addEventListener('pointermove', e => {
+  if (!pointers.has(e.pointerId)) return;
+  const p = toDevice(e);
+  if (p) send(Msg.touch(2, pointerId(e), p.x, p.y, state.w, state.h, true));
+});
+const pointerEnd = e => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.delete(e.pointerId);
+  const p = toDevice(e);
+  if (p) send(Msg.touch(1, pointerId(e), p.x, p.y, state.w, state.h, false));
+};
+screen.addEventListener('pointerup', pointerEnd);
+screen.addEventListener('pointercancel', pointerEnd);
+screen.addEventListener('contextmenu', e => e.preventDefault());
+screen.addEventListener('wheel', e => {
+  if (!state.streaming) return;
+  const p = toDevice(e);
+  if (!p || !p.inside) return;
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 1 : 100;
+  send(Msg.scroll(p.x, p.y, state.w, state.h, -e.deltaX / unit, -e.deltaY / unit));
+}, { passive: false });
+screen.addEventListener('focus', () => screen.classList.add('focused'));
+screen.addEventListener('blur', () => screen.classList.remove('focused'));
+
+const KEYMAP = {
+  ArrowUp: 19, ArrowDown: 20, ArrowLeft: 21, ArrowRight: 22, Enter: 66, NumpadEnter: 66,
+  Escape: 4, Backspace: 67, Delete: 112, Tab: 61, Home: 122, End: 123, PageUp: 92, PageDown: 93,
+};
+const held = new Set();
+screen.addEventListener('keydown', e => {
+  if (!state.streaming || e.isComposing) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return; // handled by paste
+  const code = KEYMAP[e.code];
+  if (code !== undefined) {
+    e.preventDefault();
+    send(Msg.key(0, code, e.repeat ? 1 : 0));
+    held.add(e.code);
+    return;
+  }
+  if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    sendText(e.key);
+  }
+});
+screen.addEventListener('keyup', e => {
+  if (!held.delete(e.code)) return;
+  send(Msg.key(1, KEYMAP[e.code]));
+});
+document.addEventListener('paste', e => {
+  if (document.activeElement !== screen || !state.streaming) return;
+  const t = e.clipboardData.getData('text');
+  if (t) { e.preventDefault(); send(Msg.clipboard(t, true)); }
+});
+
+// ------------------------------------------------------------ remote buttons
+function sendKey(code, long = false) {
+  if (send(Msg.key(0, code))) {
+    if (long) setTimeout(() => send(Msg.key(1, code)), 800);
+    else send(Msg.key(1, code));
+    return;
+  }
+  if (state.serial) api('/api/key', { serial: state.serial, code, long }).catch(err => toast(err.message, 'err'));
+}
+function sendText(t) {
+  // scrcpy text injection is ASCII-only; route anything else through clipboard paste
+  if (/^[\x20-\x7e]*$/.test(t) ? send(Msg.text(t)) : send(Msg.clipboard(t, true))) return true;
+  if (!state.serial) return false;
+  api('/api/text', { serial: state.serial, text: t }).catch(err => toast(err.message, 'err'));
+  return true;
+}
+
+document.querySelectorAll('[data-key]').forEach(btn => {
+  const code = +btn.dataset.key;
+  const repeatable = btn.hasAttribute('data-repeat');
+  let downAt = 0, timer = 0, live = false, repeats = 0;
+  const release = () => {
+    if (!downAt) return;
+    btn.classList.remove('pressed');
+    clearTimeout(timer); clearInterval(timer);
+    const heldMs = Date.now() - downAt;
+    downAt = 0;
+    if (live) send(Msg.key(1, code));
+    else if (repeats === 0) sendKey(code, heldMs > 600);
+  };
+  btn.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    btn.setPointerCapture(e.pointerId);
+    btn.classList.add('pressed');
+    downAt = Date.now(); repeats = 0;
+    live = send(Msg.key(0, code)); // hold-to-long-press goes straight to the device
+    if (repeatable) {
+      timer = setTimeout(() => {
+        timer = setInterval(() => {
+          repeats++;
+          if (live) send(Msg.key(0, code, repeats));
+          else sendKey(code);
+        }, 90);
+      }, 400);
+    }
+  });
+  btn.addEventListener('pointerup', release);
+  btn.addEventListener('pointercancel', release);
+  btn.addEventListener('lostpointercapture', release);
+});
+
+document.querySelectorAll('[data-ctl]').forEach(btn => btn.addEventListener('click', () => {
+  if (!send(Msg.simple(+btn.dataset.ctl))) {
+    if (btn.dataset.ctl === '5' && state.serial) {
+      api('/api/key', { serial: state.serial, code: 83 }).catch(() => {});
+    } else toast('需要先建立画面连接', 'err');
+  }
+}));
+
+$('#displayBtn').onclick = () => {
+  if (!send(Msg.displayPower(state.displayOff))) { toast('需要先建立画面连接', 'err'); return; }
+  state.displayOff = !state.displayOff;
+  $('#displayBtn').classList.toggle('on', state.displayOff);
+};
+
+$('#textForm').onsubmit = e => {
+  e.preventDefault();
+  const t = $('#textInput').value;
+  if (t && sendText(t)) $('#textInput').value = '';
+};
+
+$('#shotBtn').onclick = async () => {
+  if (!state.serial) return;
+  try {
+    const r = await fetch('/api/screenshot?serial=' + encodeURIComponent(state.serial));
+    if (!r.ok) throw new Error(await r.text());
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    a.href = url; a.download = `screenshot-${ts}.png`; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) { toast('截图失败：' + e.message, 'err'); }
+};
+
+$('#installBtn').onclick = () => state.serial && $('#apkFile').click();
+$('#apkFile').onchange = async () => {
+  const f = $('#apkFile').files[0];
+  $('#apkFile').value = '';
+  if (!f) return;
+  toast(`正在安装 ${f.name}…`);
+  const fd = new FormData(); fd.append('file', f);
+  try {
+    const r = await fetch('/api/install?serial=' + encodeURIComponent(state.serial), { method: 'POST', body: fd }).then(r => r.json());
+    toast(r.ok ? `${f.name} 安装成功` : `安装失败：${r.message}`, r.ok ? 'ok' : 'err');
+  } catch (e) { toast('安装失败：' + e.message, 'err'); }
+};
+
+async function systemAction(action, text) {
+  if (!state.serial || !(await confirmBox(text))) return;
+  try {
+    const r = await api('/api/action', { serial: state.serial, action });
+    stopStream();
+    overlay('error', action === 'shutdown' ? '设备已关机' : '设备正在重启');
+    toast(r.ok ? '指令已发送' : (r.message || '执行失败'), r.ok ? 'ok' : 'err');
+    setTimeout(refreshDevices, 1500);
+  } catch (e) { toast(e.message, 'err'); }
+}
+$('#rebootBtn').onclick = () => systemAction('reboot', '重启这台设备？');
+$('#shutdownBtn').onclick = () => systemAction('shutdown', '关闭这台设备？');
+
+// ------------------------------------------------------------ boot
+overlay('empty');
+setRemoteEnabled(!!state.serial);
+refreshDevices().then(() => { if (state.serial && state.devices.some(d => d.serial === state.serial)) selectDevice(state.serial); else { state.serial = ''; setRemoteEnabled(false); renderStatus(); } });
+setInterval(refreshDevices, 5000);
+</script>
+</body>
+</html>

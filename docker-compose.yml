@@ -1,0 +1,12 @@
+services:
+  tv-adb:
+    image: ghcr.io/tyrantcwj/tv-adb:latest
+    container_name: tv-adb
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - PASSWORD=
+    volumes:
+      - ./data:/data
+      - ./adbkeys:/root/.android
