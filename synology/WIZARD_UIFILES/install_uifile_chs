@@ -1,0 +1,18 @@
+[
+    {
+        "step_title": "TV ADB",
+        "items": [
+            {
+                "type": "password",
+                "desc": "访问密码（可留空）",
+                "subitems": [
+                    {
+                        "key": "wizard_password",
+                        "desc": "密码",
+                        "defaultValue": ""
+                    }
+                ]
+            }
+        ]
+    }
+]

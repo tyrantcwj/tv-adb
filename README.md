@@ -45,6 +45,17 @@ docker compose up -d
 docker build -t tv-adb .
 ```
 
+## 群晖套件（不需要 Docker）
+
+在 [Releases](https://github.com/tyrantcwj/tv-adb/releases) 下载 `tv-adb-*-x86_64.spk`，套件中心 → 手动安装。
+
+- 要求 DSM 7.0 及以上、x86_64 机型（DS918+ / DS921+ / DS1819+ / DVA1622 / DVA3221 等）
+- 套件自带 Python 和 adb，不依赖其他套件；安装向导里可设置访问密码
+- 装好后主菜单有 TV ADB 图标，或直接访问 `http://<NAS IP>:8765`
+- 数据和 adb 密钥在 `/var/packages/tv-adb/var`，升级保留；内部 adb 服务用 15037 端口，不和 NAS 上其他 adb 冲突
+
+自己打包：`python synology/build.py`，产物在 `dist/`。
+
 ## 设备准备
 
 设备需开启网络 ADB（开发者选项里的 USB 调试 / 无线调试，或用数据线执行 `adb tcpip 5555`）。首次连接时设备上会弹出授权框，勾选「一律允许」后在网页上点「重新连接」即可。
