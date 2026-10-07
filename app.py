@@ -25,6 +25,11 @@ SCRCPY_REMOTE = f"/data/local/tmp/scrcpy-server-v{SCRCPY_VERSION}.jar"
 log = logging.getLogger("adb-remote")
 DEVICES_FILE = DATA / "devices.json"
 push_locks: dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+# one live stream per device: a second viewer takes over instead of starting another encoder
+sessions: dict[str, "Session"] = {}
+SEND_BUFFER = 512 * 1024
+MAX_LAG = 1.0  # seconds a frame may stay unacknowledged by the viewer before we start dropping
+ACK_EVERY = 5  # the page acks every 5th frame
 
 
 async def adb(*args, timeout=15, data=None):
@@ -59,7 +64,7 @@ def save_saved(items):
     DEVICES_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=1), "utf-8")
 
 
-def remember(serial, model=None, name=None):
+def remember(serial, model=None, name=None, auto=None):
     items = load_saved()
     item = next((d for d in items if d["serial"] == serial), None)
     if item is None:
@@ -67,6 +72,8 @@ def remember(serial, model=None, name=None):
         items.append(item)
     if model:
         item["model"] = model
+    if auto is not None:
+        item["auto"] = auto
     if name is not None:
         if name:
             item["name"] = name
@@ -97,7 +104,8 @@ async def list_devices():
     result = []
     for d in saved:
         cur = found.pop(d["serial"], None)
-        result.append({"serial": d["serial"], "state": cur["state"] if cur else "offline",
+        state = cur["state"] if cur else ("disconnected" if d.get("auto") is False else "offline")
+        result.append({"serial": d["serial"], "state": state,
                        "model": (cur and cur["model"]) or d.get("model", ""), "name": d.get("name", ""),
                        "saved": True})
     for d in found.values():
@@ -142,7 +150,7 @@ async def api_connect(request):
     if state == "device":
         _, model = await adb_text("-s", addr, "shell", "getprop", "ro.product.model", timeout=5)
     if ok:
-        remember(addr, model)
+        remember(addr, model, auto=True)
     return web.json_response({"ok": ok, "serial": addr, "state": state, "model": model, "message": out})
 
 
@@ -165,8 +173,36 @@ async def api_save(request):
     return web.json_response({"ok": True, "serial": serial})
 
 
+class Session:
+    def __init__(self, ws):
+        self.ws = ws
+        self.task = asyncio.current_task()
+        self.released = asyncio.Event()  # set once scrcpy is gone from the device
+
+
+async def close_session(serial, message):
+    """Stop a device's live stream and wait until its encoder has left the device
+    (some SoCs, e.g. RK3399, cannot run two encoders at once)."""
+    sess = sessions.pop(serial, None)
+    if sess is None:
+        return
+    if not sess.ws.closed:
+        try:
+            await sess.ws.send_json({"type": "error", "message": message})
+        except Exception:
+            pass
+    sess.task.cancel()
+    try:
+        await asyncio.wait_for(sess.released.wait(), 8)
+    except asyncio.TimeoutError:
+        log.warning("%s: previous stream did not stop in time", serial)
+
+
 async def api_disconnect(request):
     serial = body_serial(await request.json())
+    await close_session(serial, "已断开")
+    if any(d["serial"] == serial for d in load_saved()):
+        remember(serial, auto=False)
     rc, out = await adb_text("disconnect", serial)
     return web.json_response({"ok": rc == 0, "message": out})
 
@@ -287,8 +323,19 @@ def clamp_int(v, lo, hi, default):
 
 async def ws_stream(request):
     serial = request.query.get("serial", "")
-    ws = web.WebSocketResponse(max_msg_size=1 << 20)
+    # heartbeat reaps half-open sockets (sleeping phones) so the device stops encoding
+    ws = web.WebSocketResponse(max_msg_size=1 << 20, heartbeat=15)
     await ws.prepare(request)
+    await close_session(serial, "画面已在其他窗口打开")
+    sess = sessions[serial] = Session(ws)
+    transport = request.transport
+    sock = transport.get_extra_info("socket") if transport else None
+    if sock is not None:
+        try:
+            import socket
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SEND_BUFFER)
+        except OSError:
+            pass
 
     max_size = clamp_int(request.query.get("max_size"), 0, 4096, 1280)
     bit_rate = clamp_int(request.query.get("bit_rate"), 200_000, 50_000_000, 4_000_000)
@@ -306,6 +353,7 @@ async def ws_stream(request):
         if not ws.closed:
             await ws.send_json({"type": "error", "message": msg})
             await ws.close()
+        return ws
 
     try:
         try:
@@ -371,12 +419,43 @@ async def ws_stream(request):
         height = int.from_bytes(meta[8:12], "big")
         await ws.send_json({"type": "meta", "name": name, "codec": codec, "width": width, "height": height})
 
+        # the page acks every few frames ("a<count>"); OS socket buffers hide a slow viewer otherwise
+        flow = {"acked": 0, "acking": False}
+        inflight = collections.deque()  # (frame number, send time)
+
         async def pump_video():
+            loop = asyncio.get_running_loop()
+            sent = 0
+            skipping = False
+            last_reset = 0.0
             while True:
                 hdr = await vr.readexactly(12)
                 size = int.from_bytes(hdr[8:12], "big")
                 payload = await vr.readexactly(size)
+                config, key = hdr[0] & 0x80, hdr[0] & 0x40
+                if not config:
+                    now = loop.time()
+                    while inflight and inflight[0][0] <= flow["acked"]:
+                        inflight.popleft()
+                    # the last ACK_EVERY frames may legitimately be unacked (acks are batched)
+                    lagging = (flow["acking"] and len(inflight) > ACK_EVERY
+                               and now - inflight[0][1] > MAX_LAG)
+                    backlog = transport.get_write_buffer_size() if transport else 0
+                    # rather than queue seconds of latency, drop everything while the viewer is behind,
+                    # then resume from a fresh key frame
+                    if lagging or backlog > SEND_BUFFER // 2:
+                        skipping = True
+                        continue
+                    if skipping:
+                        if not key:
+                            if now - last_reset > 1:
+                                cw.write(b"\x11")  # RESET_VIDEO -> fresh config + key frame
+                                last_reset = now
+                            continue
+                        skipping = False
                 await ws.send_bytes(hdr + payload)
+                sent += 1
+                inflight.append((sent, loop.time()))
 
         async def drain_device_msgs():
             while await cr.read(4096):
@@ -387,6 +466,9 @@ async def ws_stream(request):
                 if msg.type == WSMsgType.BINARY:
                     cw.write(msg.data)
                     await cw.drain()
+                elif msg.type == WSMsgType.TEXT and msg.data[:1] == "a" and msg.data[1:].isdigit():
+                    flow["acked"] = int(msg.data[1:])
+                    flow["acking"] = True
                 elif msg.type == WSMsgType.ERROR:
                     break
 
@@ -400,7 +482,13 @@ async def ws_stream(request):
                 log.warning("%s stream ended: %r", serial, exc)
         if not ws.closed and not any(t is live[2] for t in done):
             await ws.send_json({"type": "error", "message": "画面连接已断开"})
+    except asyncio.CancelledError:
+        pass  # taken over by another viewer, or the device was disconnected
+    except ConnectionError:
+        pass
     finally:
+        if sessions.get(serial) is sess:
+            del sessions[serial]
         for t in tasks:
             t.cancel()
         for w in writers:
@@ -413,6 +501,7 @@ async def ws_stream(request):
                 pass
         if port:
             await adb_text("-s", serial, "forward", "--remove", f"tcp:{port}")
+        sess.released.set()
         if not ws.closed:
             await ws.close()
     return ws
@@ -444,7 +533,7 @@ async def on_startup(app):
 
     async def reconnect():
         for d in load_saved():
-            if ":" in d["serial"]:
+            if ":" in d["serial"] and d.get("auto") is not False:
                 await adb_text("connect", d["serial"], timeout=8)
 
     app["reconnect"] = asyncio.create_task(reconnect())

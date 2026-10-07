@@ -128,6 +128,13 @@ aside.remote > * { flex: none; }
 }
 .statusbar b { color: var(--text); font-weight: 500; }
 .statusbar .sp { flex: 1; }
+.sb-btn {
+  display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; margin-left: 4px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); color: var(--muted);
+  font-size: 12px; cursor: pointer;
+}
+.sb-btn:hover { color: var(--danger); border-color: rgba(248,113,113,.4); background: var(--danger-soft); }
+.sb-btn svg { width: 14px; height: 14px; }
 
 /* ---------- remote ---------- */
 .group { display: flex; flex-direction: column; gap: 8px; }
@@ -369,6 +376,7 @@ dialog form .acts { margin-top: 18px; }
   <symbol id="i-reboot" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></symbol>
   <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2Z"/><path d="M12 7v6M9 10h6"/></symbol>
   <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/></symbol>
+  <symbol id="i-unplug" viewBox="0 0 24 24"><path d="m19 5 3-3"/><path d="m2 22 3-3"/><path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z"/><path d="M7.5 13.5 10 11"/><path d="M10.5 16.5 13 14"/><path d="m12 6 6 6 2.3-2.3a2.4 2.4 0 0 0 0-3.4l-2.6-2.6a2.4 2.4 0 0 0-3.4 0Z"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
   <symbol id="i-phone" viewBox="0 0 24 24"><rect width="14" height="20" x="5" y="2" rx="2"/><path d="M12 18h.01"/></symbol>
 </svg>
@@ -449,9 +457,9 @@ function concat(a, b) {
 
 // WebCodecs (secure context) — lowest latency
 class WebCodecsPlayer {
-  constructor(canvas, onFrame, onBroken) {
+  constructor(canvas, onFrame, onBroken, onLag) {
     this.canvas = canvas; this.ctx = canvas.getContext('2d');
-    this.onFrame = onFrame; this.onBroken = onBroken;
+    this.onFrame = onFrame; this.onBroken = onBroken; this.onLag = onLag;
     this.dec = null; this.cfg = null; this.needKey = true;
   }
   el() { return this.canvas; }
@@ -475,6 +483,7 @@ class WebCodecsPlayer {
   }
   frame(data, key, pts) {
     if (!this.dec || this.dec.state !== 'configured') return;
+    if (!key && this.dec.decodeQueueSize > 6) { this.needKey = true; this.onLag(); }
     if (this.needKey && !key) return;
     this.needKey = false;
     try {
@@ -486,7 +495,7 @@ class WebCodecsPlayer {
 
 // MSE via JMuxer — works over plain http on a LAN IP
 class MsePlayer {
-  constructor(video, fps, onFrame, onBroken) {
+  constructor(video, fps, onFrame, onBroken, onLag) {
     this.video = video; this.fps = fps; this.onFrame = onFrame; this.onBroken = onBroken;
     this.jm = null; this.sps = ''; this.cfg = null; this.needKey = true;
     this.onResize = () => video.videoWidth && onFrame(video.videoWidth, video.videoHeight, true);
@@ -498,7 +507,10 @@ class MsePlayer {
     const v = this.video;
     if (!v.buffered.length) return;
     const end = v.buffered.end(v.buffered.length - 1);
-    if (end - v.currentTime > 0.25) v.currentTime = Math.max(v.buffered.start(v.buffered.length - 1), end - 0.03);
+    const lag = end - v.currentTime;
+    if (lag > 1.5) v.currentTime = Math.max(v.buffered.start(v.buffered.length - 1), end - 0.05);
+    const rate = lag > 0.4 ? 1.6 : lag > 0.15 ? 1.2 : 1;
+    if (v.playbackRate !== rate) v.playbackRate = rate;
     if (v.paused) v.play().catch(() => {});
   }
   config(data) {
@@ -506,7 +518,7 @@ class MsePlayer {
     if (this.jm && sps !== this.sps) { this.jm.destroy(); this.jm = null; }
     this.sps = sps;
     if (!this.jm) {
-      this.jm = new JMuxer({ node: this.video, mode: 'video', flushingTime: 0, fps: this.fps, debug: false, onError: () => this.onBroken() });
+      this.jm = new JMuxer({ node: this.video, mode: 'video', flushingTime: 0, fps: this.fps, maxDelay: 3000, debug: false, onError: () => this.onBroken() });
     }
     this.cfg = data.slice();
     this.needKey = true;
@@ -571,6 +583,10 @@ function overlay(kind, text = '') {
   o.hidden = false;
   if (kind === 'empty') o.innerHTML = `<svg class="i big"><use href="#i-phone"/></svg>`;
   else if (kind === 'loading') o.innerHTML = `<div class="spinner"></div>${text ? `<div class="msg">${esc(text)}</div>` : ''}`;
+  else if (kind === 'idle') {
+    o.innerHTML = `<svg class="i big"><use href="#i-phone"/></svg><div class="msg">${esc(text)}</div><button id="retryBtn">连接</button>`;
+    $('#retryBtn').onclick = () => selectDevice(state.serial, true);
+  }
   else if (kind === 'error') {
     o.innerHTML = `<svg class="i big"><use href="#i-phone"/></svg><div class="msg err">${esc(text)}</div><button id="retryBtn">重新连接</button>`;
     $('#retryBtn').onclick = () => selectDevice(state.serial, true);
@@ -584,11 +600,13 @@ function renderStatus() {
   if (+state.info?.battery > 0) left.push(`电量 ${esc(state.info.battery)}%`);
   const right = state.streaming && state.w ? [`${state.w}×${state.h}`, `${state.fps} fps`] : [];
   right.push(esc(state.serial));
-  $('#statusbar').innerHTML = `${left.join('<span>·</span>')}<span class="sp"></span>${right.join('<span>·</span>')}`;
+  const online = d?.state === 'device' || state.streaming;
+  const btn = online ? `<button class="sb-btn" id="disconnectBtn"><svg class="i"><use href="#i-unplug"/></svg>断开</button>` : '';
+  $('#statusbar').innerHTML = `${left.join('<span>·</span>')}<span class="sp"></span>${right.join('<span>·</span>')}${btn}`;
 }
 function deviceLabel(d) { return d.name || d.model || d.serial; }
 function renderChips() {
-  const stateText = { device: '', unauthorized: '待授权', offline: '离线' };
+  const stateText = { device: '', unauthorized: '待授权', offline: '离线', disconnected: '已断开' };
   $('#chips').innerHTML = state.devices.map(d => `
     <div class="chip ${d.serial === state.serial ? 'active' : ''}" data-serial="${esc(d.serial)}">
       <span class="dot ${esc(d.state)}"></span>
@@ -709,6 +727,7 @@ function startStream() {
   state.ws = ws;
   overlay('loading', '');
   let failed = false;
+  let received = 0;
 
   const onFrame = (w, h, fromResize) => {
     if (w && h && (w !== state.w || h !== state.h)) { state.w = w; state.h = h; setAspect(); renderStatus(); }
@@ -723,10 +742,16 @@ function startStream() {
   const onBroken = () => {
     if (state.ws !== ws) return;
     state.player.destroy();
-    state.player = makePlayer(+fps, onFrame, onBroken);
+    state.player = makePlayer(+fps, onFrame, onBroken, onLag);
     send(Msg.simple(17)); // RESET_VIDEO: server re-sends config + key frame
   };
-  state.player = makePlayer(+fps, onFrame, onBroken);
+  let lastReset = 0;
+  const onLag = () => {
+    if (Date.now() - lastReset < 2000) return;
+    lastReset = Date.now();
+    send(Msg.simple(17));
+  };
+  state.player = makePlayer(+fps, onFrame, onBroken, onLag);
 
   ws.onmessage = ev => {
     if (state.ws !== ws) return;
@@ -736,6 +761,8 @@ function startStream() {
       else if (m.type === 'error') { failed = true; showStreamError(m.message); }
       return;
     }
+    received++;
+    if (received % 5 === 0) ws.send('a' + received); // flow-control ack, see pump_video
     const dv = new DataView(ev.data);
     const hi = dv.getUint32(0), lo = dv.getUint32(4), size = dv.getUint32(8);
     const data = new Uint8Array(ev.data, 12, size);
@@ -758,8 +785,8 @@ function fitScreen() {
   }
 }
 new ResizeObserver(fitScreen).observe($('.screen-inner'));
-function makePlayer(fps, onFrame, onBroken) {
-  return useWebCodecs ? new WebCodecsPlayer($('#canvas'), onFrame, onBroken) : new MsePlayer($('#video'), fps, onFrame, onBroken);
+function makePlayer(fps, onFrame, onBroken, onLag) {
+  return useWebCodecs ? new WebCodecsPlayer($('#canvas'), onFrame, onBroken, onLag) : new MsePlayer($('#video'), fps, onFrame, onBroken, onLag);
 }
 function showStreamError(msg) {
   stopStream();
@@ -784,6 +811,36 @@ setInterval(() => {
   if (state.streaming) { state.fps = state.frames; state.frames = 0; renderStatus(); }
 }, 1000);
 $('#quality').onchange = () => { if (state.serial) selectDevice(state.serial, true); };
+
+$('#statusbar').onclick = async e => {
+  if (!e.target.closest('#disconnectBtn') || !state.serial) return;
+  const serial = state.serial;
+  stopStream();
+  overlay('idle', '已断开');
+  try { await api('/api/disconnect', { serial }); } catch (err) { toast(err.message, 'err'); }
+  refreshDevices();
+};
+
+// a hidden tab keeps the device encoding for nobody; stop and resume on return
+let hiddenSince = 0, pausedHidden = false;
+function checkHidden() {
+  if (document.hidden) {
+    hiddenSince ||= Date.now();
+    if (state.ws && Date.now() - hiddenSince > 15000) {
+      stopStream();
+      overlay('loading');
+      pausedHidden = true;
+    }
+  } else {
+    hiddenSince = 0;
+    if (pausedHidden) {
+      pausedHidden = false;
+      if (state.serial) selectDevice(state.serial, true);
+    }
+  }
+}
+document.addEventListener('visibilitychange', checkHidden);
+setInterval(checkHidden, 1000);
 
 // ------------------------------------------------------------ screen input
 const screen = $('#screen');
@@ -981,7 +1038,7 @@ $('#shutdownBtn').onclick = () => systemAction('shutdown', '关闭这台设备�
 // ------------------------------------------------------------ boot
 overlay('empty');
 setRemoteEnabled(!!state.serial);
-refreshDevices().then(() => { if (state.serial && state.devices.some(d => d.serial === state.serial)) selectDevice(state.serial); else { state.serial = ''; setRemoteEnabled(false); renderStatus(); } });
+refreshDevices().then(() => { if (state.serial && state.devices.some(d => d.serial === state.serial && d.state === 'device')) selectDevice(state.serial); else { state.serial = ''; setRemoteEnabled(false); renderStatus(); } });
 setInterval(refreshDevices, 5000);
 </script>
 </body>
