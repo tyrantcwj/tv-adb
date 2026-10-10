@@ -19,14 +19,12 @@ DATA = Path(os.environ.get("DATA_DIR", BASE / "data"))
 PORT = int(os.environ.get("PORT", "8765"))
 PASSWORD = os.environ.get("PASSWORD", "")
 ADB = os.environ.get("ADB", "adb")
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 SCRCPY_VERSION = os.environ.get("SCRCPY_VERSION", "3.3.4")
 SCRCPY_LOCAL = Path(os.environ.get("SCRCPY_SERVER", BASE / "server" / f"scrcpy-server-v{SCRCPY_VERSION}"))
-SCRCPY_REMOTE = f"/data/local/tmp/scrcpy-server-v{SCRCPY_VERSION}.jar"
 
 log = logging.getLogger("adb-remote")
 DEVICES_FILE = DATA / "devices.json"
-push_locks: dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 # one live stream per device: a second viewer takes over instead of starting another encoder
 sessions: dict[str, "Session"] = {}
 SEND_BUFFER = 512 * 1024
@@ -316,18 +314,18 @@ async def api_install(request):
 
 # ---------------------------------------------------------------- scrcpy stream
 
-async def ensure_server(serial):
-    size = SCRCPY_LOCAL.stat().st_size
-    async with push_locks[serial]:
-        rc, out = await adb_text("-s", serial, "shell", f"stat -c %s {SCRCPY_REMOTE} 2>/dev/null")
-        if out.strip() == str(size):
-            return
-        rc, out = await adb_text("-s", serial, "push", str(SCRCPY_LOCAL), SCRCPY_REMOTE, timeout=60)
-        if rc != 0:
-            raise RuntimeError(out)
+async def push_server(serial):
+    """Push a private copy of scrcpy-server and return its command prefix.
 
-
-SCRCPY_CMD = f"CLASSPATH={SCRCPY_REMOTE} app_process / com.genymobile.scrcpy.Server {SCRCPY_VERSION}"
+    With cleanup=true scrcpy deletes its own jar as soon as it starts, so every launch (including
+    retries within one session) needs a fresh copy; a unique name keeps a previous run's cleanup
+    from deleting the next run's jar.
+    """
+    path = f"/data/local/tmp/tvadb-{random.getrandbits(32):08x}.jar"
+    rc, out = await adb_text("-s", serial, "push", str(SCRCPY_LOCAL), path, timeout=60)
+    if rc != 0:
+        raise RuntimeError(f"推送 scrcpy-server 失败：{out}")
+    return f"CLASSPATH={path} app_process / com.genymobile.scrcpy.Server {SCRCPY_VERSION}"
 # per-device encoder that is known to work, for devices whose default (hardware) encoder fails
 encoder_pref: dict[str, str] = {}
 # full scrcpy output of the last failed start per device, served by /api/diag for remote debugging
@@ -358,7 +356,11 @@ ENCODER_RE = re.compile(r"--video-codec=h264 --video-encoder=(\S+)(?:[ \t]+\((\w
 async def fallback_encoder(serial, failed):
     """Pick another H.264 encoder, preferring the platform software one.
     Returns (encoder or "", raw scrcpy output for diagnostics)."""
-    rc, out = await adb_text("-s", serial, "shell", f"{SCRCPY_CMD} list_encoders=true log_level=info", timeout=20)
+    try:
+        prefix = await push_server(serial)
+    except RuntimeError as e:
+        return "", str(e)
+    rc, out = await adb_text("-s", serial, "shell", f"{prefix} list_encoders=true log_level=info", timeout=20)
     log.info("[%s] encoders:\n%s", serial, out)
     # before Android 10 scrcpy prints no (sw)/(hw) tag; Google's encoders are the software ones
     found = [(name, kind or ("sw" if re.search(r"google|c2\.android", name, re.I) else "hw"))
@@ -658,13 +660,14 @@ async def ws_stream(request):
     async def start_scrcpy(video_opts, with_video):
         """Start scrcpy-server; returns (video reader or None, control reader, control writer, device name)."""
         output.clear()
+        prefix = await push_server(serial)
         scid = "%08x" % random.getrandbits(31)
         rc, out = await adb_text("-s", serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}")
         if rc != 0 or not out.strip().isdigit():
             raise RuntimeError(f"adb forward 失败：{out}")
         port = live_state["port"] = int(out.strip())
 
-        cmd = (f"{SCRCPY_CMD} scid={scid} log_level=info tunnel_forward=true audio=false control=true "
+        cmd = (f"{prefix} scid={scid} log_level=info tunnel_forward=true audio=false control=true "
                f"cleanup=true clipboard_autosync=false {video_opts}")
         proc = live_state["proc"] = await asyncio.create_subprocess_exec(
             ADB, "-s", serial, "shell", cmd,
@@ -728,11 +731,6 @@ async def ws_stream(request):
         return source, cr, cw, name, (width, height), (dw, dh)
 
     try:
-        try:
-            await ensure_server(serial)
-        except Exception as e:
-            return await fail(f"推送 scrcpy-server 失败：{e}")
-
         encoder = saved_encoder(serial)
         started = None
         failure = None
