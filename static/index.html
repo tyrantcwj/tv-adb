@@ -757,7 +757,11 @@ function startStream() {
     if (state.ws !== ws) return;
     if (typeof ev.data === 'string') {
       const m = JSON.parse(ev.data);
-      if (m.type === 'meta') { state.name = m.name; state.w = m.width; state.h = m.height; setAspect(); renderStatus(); }
+      if (m.type === 'meta') {
+        state.name = m.name; state.w = m.width; state.h = m.height;
+        state.tw = m.touchWidth || 0; state.th = m.touchHeight || 0;
+        setAspect(); renderStatus();
+      }
       else if (m.type === 'error') { failed = true; showStreamError(m.message); }
       return;
     }
@@ -852,7 +856,12 @@ function toDevice(e) {
   const s = Math.min(r.width / state.w, r.height / state.h);
   const ox = r.left + (r.width - state.w * s) / 2, oy = r.top + (r.height - state.h * s) / 2;
   const x = Math.round((e.clientX - ox) / s), y = Math.round((e.clientY - oy) / s);
-  return { x: Math.max(0, Math.min(state.w - 1, x)), y: Math.max(0, Math.min(state.h - 1, y)), inside: x >= 0 && y >= 0 && x < state.w && y < state.h };
+  const p = { x: Math.max(0, Math.min(state.w - 1, x)), y: Math.max(0, Math.min(state.h - 1, y)), inside: x >= 0 && y >= 0 && x < state.w && y < state.h };
+  if (state.tw) {
+    // screenrecord mode: scrcpy runs without video and takes raw display coordinates
+    p.x = Math.round(p.x * state.tw / state.w); p.y = Math.round(p.y * state.th / state.h);
+  }
+  return p;
 }
 function pointerId(e) { return e.pointerType === 'mouse' ? -2n : BigInt(e.pointerId); }
 

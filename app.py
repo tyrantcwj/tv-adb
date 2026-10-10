@@ -19,7 +19,7 @@ DATA = Path(os.environ.get("DATA_DIR", BASE / "data"))
 PORT = int(os.environ.get("PORT", "8765"))
 PASSWORD = os.environ.get("PASSWORD", "")
 ADB = os.environ.get("ADB", "adb")
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.1.0"
 SCRCPY_VERSION = os.environ.get("SCRCPY_VERSION", "3.3.4")
 SCRCPY_LOCAL = Path(os.environ.get("SCRCPY_SERVER", BASE / "server" / f"scrcpy-server-v{SCRCPY_VERSION}"))
 SCRCPY_REMOTE = f"/data/local/tmp/scrcpy-server-v{SCRCPY_VERSION}.jar"
@@ -383,6 +383,203 @@ def scrcpy_reason(output, exc):
     return "\n".join(lines[-10:]) or str(exc) or exc.__class__.__name__
 
 
+SCREENRECORD = "screenrecord"  # pseudo encoder name: stream via the device's screenrecord binary
+FLAG_CONFIG = 1 << 63
+FLAG_KEY = 1 << 62
+
+
+def packet(data, config=False, key=False, pts=0):
+    """Same 12-byte framing scrcpy uses, so the page needs one code path."""
+    flags = FLAG_CONFIG if config else (pts | (FLAG_KEY if key else 0))
+    return flags.to_bytes(8, "big") + len(data).to_bytes(4, "big"), bytes(data)
+
+
+class AnnexBFramer:
+    """Cut a raw H.264 Annex B byte stream into access units (one packet per picture)."""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.config = bytearray()
+        self.prefix = bytearray()
+        self.au = bytearray()
+        self.au_key = False
+        self.t0 = time.monotonic()
+        self.emitted = False
+        self.broken = False  # a flush cut a NAL short; the caller should restart for a clean key frame
+        self.junk = bytearray()  # non-H.264 output (screenrecord error text)
+
+    def _pts(self):
+        return int((time.monotonic() - self.t0) * 1e6)
+
+    def _end_au(self):
+        if not self.au:
+            return []
+        out = [packet(self.au, key=self.au_key, pts=self._pts())]
+        self.au = bytearray()
+        self.au_key = False
+        self.emitted = True
+        return out
+
+    def _nal(self, nal):
+        t = nal[0] & 0x1F
+        out = []
+        if t in (7, 8):  # SPS / PPS
+            out += self._end_au()
+            self.config += b"\0\0\0\1" + nal
+        elif t in (1, 5):  # picture slice
+            if len(nal) > 1 and nal[1] & 0x80:  # first_mb_in_slice == 0: a new picture starts
+                out += self._end_au()
+            if self.config:
+                out.append(packet(self.config, config=True))
+                self.config = bytearray()
+            if not self.au and self.prefix:
+                self.au += self.prefix
+                self.prefix = bytearray()
+            self.au += b"\0\0\0\1" + nal
+            self.au_key |= t == 5
+        elif t in (6, 9):  # SEI / access unit delimiter belong to the next picture
+            out += self._end_au()
+            self.prefix += b"\0\0\0\1" + nal
+        return out
+
+    def _process(self, final):
+        data = self.buf
+        starts = []
+        i = data.find(b"\0\0\1")
+        while i != -1:
+            starts.append(i)
+            i = data.find(b"\0\0\1", i + 3)
+        if not starts:
+            if final:
+                self._discard(len(data))
+            return []
+        if starts[0] > 0:
+            self._discard(starts[0])
+        ends = starts[1:] + ([len(data)] if final else [])
+        out = []
+        for a, b in zip(starts, ends):
+            nal = bytes(data[a + 3:b]).rstrip(b"\0")
+            if nal:
+                out += self._nal(nal)
+        del data[:starts[len(ends)] if len(ends) < len(starts) else len(data)]
+        if final:
+            out += self._end_au()
+        return out
+
+    def _discard(self, n):
+        if self.emitted and any(self.buf[:n]):
+            self.broken = True  # bytes without a start code after we already flushed: the flush was early
+        elif len(self.junk) < 2000:
+            self.junk += self.buf[:n]
+
+    def feed(self, data):
+        self.buf += data
+        return self._process(final=False)
+
+    def flush(self):
+        return self._process(final=True)
+
+
+class ScrcpyVideo:
+    """Packets straight from scrcpy's video socket."""
+
+    def __init__(self, reader, control_writer):
+        self.reader, self.cw = reader, control_writer
+
+    async def next(self):
+        hdr = await self.reader.readexactly(12)
+        return hdr, await self.reader.readexactly(int.from_bytes(hdr[8:12], "big"))
+
+    def request_key(self):
+        self.cw.write(b"\x11")  # RESET_VIDEO -> fresh config + key frame
+
+    async def close(self):
+        pass
+
+
+class ScreenRecordVideo:
+    """H.264 from the device's own screenrecord binary.
+
+    For ROMs whose Java MediaCodec cannot be created from the shell user at all, e.g. Hisense VIDAA
+    whose MediaCodec.<init> does a SystemProperties.set that shell is not allowed to do. screenrecord
+    uses the native codec and never hits that hook. It stops after 3 minutes, so it is respawned.
+    """
+
+    TIME_LIMIT = 180
+    IDLE_FLUSH = 0.05  # a quiet pipe means the current picture is complete
+
+    def __init__(self, serial, width, height, bit_rate):
+        self.serial, self.width, self.height, self.bit_rate = serial, width, height, bit_rate
+        self.proc = None
+        self.framer = None
+        self.queue = collections.deque()
+        self.restart = False
+        self.quick_exits = 0
+
+    async def _spawn(self):
+        await self.close()
+        self.framer = AnnexBFramer()
+        self.started = time.monotonic()
+        self.proc = await asyncio.create_subprocess_exec(
+            ADB, "-s", self.serial, "exec-out", "screenrecord", "--output-format=h264",
+            f"--size={self.width}x{self.height}", f"--bit-rate={self.bit_rate}",
+            f"--time-limit={self.TIME_LIMIT}", "-",
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+
+    async def start(self):
+        """Spawn and wait for the first picture, so failures surface before the page is told we're live."""
+        await self._spawn()
+        first = await asyncio.wait_for(self.next(), 15)
+        self.queue.appendleft(first)
+
+    async def next(self):
+        while not self.queue:
+            if self.proc is None or self.restart or (self.framer and self.framer.broken):
+                self.restart = False
+                await self._spawn()
+            try:
+                chunk = await asyncio.wait_for(self.proc.stdout.read(1 << 16), self.IDLE_FLUSH)
+            except asyncio.TimeoutError:
+                self.queue.extend(self.framer.flush())
+                continue
+            if chunk:
+                self.queue.extend(self.framer.feed(chunk))
+                continue
+            # screenrecord ended: normally its time limit, otherwise it failed outright
+            self.queue.extend(self.framer.flush())
+            await self.proc.wait()
+            lived = time.monotonic() - self.started
+            self.quick_exits = 0 if lived > 10 or self.framer.emitted else self.quick_exits + 1
+            if self.quick_exits >= 2:
+                text = self.framer.junk.decode("utf-8", "replace").strip()
+                raise RuntimeError(f"screenrecord 退出：{text or self.proc.returncode}")
+            self.proc = None
+        return self.queue.popleft()
+
+    def request_key(self):
+        self.restart = True  # a new screenrecord starts with SPS/PPS + IDR
+
+    async def close(self):
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 3)
+            except asyncio.TimeoutError:
+                pass
+        self.proc = None
+
+
+async def display_size(serial):
+    rc, out = await adb_text("-s", serial, "shell", "wm size")
+    sizes = {k: (int(w), int(h)) for k, w, h in re.findall(r"(Physical|Override) size:\s*(\d+)x(\d+)", out)}
+    return sizes.get("Override") or sizes.get("Physical") or (1920, 1080)
+
+
+def fit_size(width, height, max_size):
+    k = min(1.0, max_size / max(width, height)) if max_size else 1.0
+    return max(16, int(width * k) // 16 * 16), max(16, int(height * k) // 16 * 16)
+
+
 def clamp_int(v, lo, hi, default):
     try:
         return max(lo, min(hi, int(v)))
@@ -410,7 +607,7 @@ async def ws_stream(request):
     bit_rate = clamp_int(request.query.get("bit_rate"), 200_000, 50_000_000, 4_000_000)
     max_fps = clamp_int(request.query.get("max_fps"), 1, 120, 30)
 
-    live_state = {"proc": None, "port": None, "reader": None}
+    live_state = {"proc": None, "port": None, "reader": None, "source": None}
     writers = []
     tasks = []
     output = collections.deque(maxlen=40)
@@ -426,6 +623,9 @@ async def ws_stream(request):
         for t in tasks:
             t.cancel()
         tasks.clear()
+        if live_state["source"]:
+            await live_state["source"].close()
+            live_state["source"] = None
         for w in writers:
             w.close()
         writers.clear()
@@ -455,7 +655,8 @@ async def ws_stream(request):
             except (asyncio.TimeoutError, Exception):
                 pass
 
-    async def launch(encoder, size):
+    async def start_scrcpy(video_opts, with_video):
+        """Start scrcpy-server; returns (video reader or None, control reader, control writer, device name)."""
         output.clear()
         scid = "%08x" % random.getrandbits(31)
         rc, out = await adb_text("-s", serial, "forward", "tcp:0", f"localabstract:scrcpy_{scid}")
@@ -464,8 +665,7 @@ async def ws_stream(request):
         port = live_state["port"] = int(out.strip())
 
         cmd = (f"{SCRCPY_CMD} scid={scid} log_level=info tunnel_forward=true audio=false control=true "
-               f"cleanup=true video_codec=h264 max_size={size} video_bit_rate={bit_rate} max_fps={max_fps} "
-               f"clipboard_autosync=false" + (f" video_encoder={encoder}" if encoder else ""))
+               f"cleanup=true clipboard_autosync=false {video_opts}")
         proc = live_state["proc"] = await asyncio.create_subprocess_exec(
             ADB, "-s", serial, "shell", cmd,
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -501,13 +701,31 @@ async def ws_stream(request):
                     await asyncio.sleep(0.15)
             raise RuntimeError("scrcpy-server 启动超时")
 
-        vr, vw = await open_socket(True)
-        writers.append(vw)
-        cr, cw = await open_socket(False)
+        vr = None
+        if with_video:
+            vr, vw = await open_socket(True)
+            writers.append(vw)
+        # without video the control socket is the first one: it gets the dummy byte and the device name
+        cr, cw = await open_socket(not with_video)
         writers.append(cw)
-        name = (await asyncio.wait_for(vr.readexactly(64), 10)).split(b"\0", 1)[0].decode("utf-8", "replace")
+        name = (await asyncio.wait_for((vr or cr).readexactly(64), 10)).split(b"\0", 1)[0].decode("utf-8", "replace")
+        return vr, cr, cw, name
+
+    async def launch(encoder, size):
+        vr, cr, cw, name = await start_scrcpy(
+            f"video_codec=h264 max_size={size} video_bit_rate={bit_rate} max_fps={max_fps}"
+            + (f" video_encoder={encoder}" if encoder else ""), True)
         meta = await asyncio.wait_for(vr.readexactly(12), 15)
-        return vr, cr, cw, name, meta
+        width, height = int.from_bytes(meta[4:8], "big"), int.from_bytes(meta[8:12], "big")
+        return ScrcpyVideo(vr, cw), cr, cw, name, (width, height), None
+
+    async def launch_screenrecord():
+        _, cr, cw, name = await start_scrcpy("video=false", False)
+        dw, dh = await display_size(serial)
+        width, height = fit_size(dw, dh, max_size)
+        source = live_state["source"] = ScreenRecordVideo(serial, width, height, bit_rate)
+        await source.start()
+        return source, cr, cw, name, (width, height), (dw, dh)
 
     try:
         try:
@@ -516,37 +734,57 @@ async def ws_stream(request):
             return await fail(f"推送 scrcpy-server 失败：{e}")
 
         encoder = saved_encoder(serial)
-        try:
-            # a remembered fallback encoder is usually the software one, which can't keep up above 720p
-            vr, cr, cw, name, meta = await launch(encoder, min(max_size or 1280, 1280) if encoder else max_size)
-        except Exception as e:
-            await collect_exit_log()
-            reason = scrcpy_reason(output, e)
-            failure = last_failure[serial] = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "encoder": encoder,
-                                              "first": list(output) or [repr(e)]}
-            await teardown()
-            # TV SoCs often ship a hardware encoder scrcpy cannot drive; retry once with another one
-            retry, listing = ("", "") if encoder else await fallback_encoder(serial, encoder)
-            failure["encoders"] = listing.splitlines()
-            if not retry and not encoder:
-                listing = "\n".join(l.strip() for l in listing.splitlines() if "video-encoder" in l or "rror" in l)
-                return await fail(f"scrcpy 启动失败：{reason}\n\n没有可换的 H.264 编码器" + (f"：\n{listing}" if listing else ""))
-            log.warning("%s: encoder %r failed (%s), retrying with %r", serial, encoder or "default", reason, retry or "default")
-            size = min(max_size or 1280, 1280) if retry else max_size  # software encoders are slow
+        started = None
+        failure = None
+        if encoder != SCREENRECORD:
             try:
-                vr, cr, cw, name, meta = await launch(retry, size)
-            except Exception as e2:
+                # a remembered fallback encoder is usually the software one, which can't keep up above 720p
+                started = await launch(encoder, min(max_size or 1280, 1280) if encoder else max_size)
+            except Exception as e:
                 await collect_exit_log()
-                failure["retry"] = retry
-                failure["second"] = list(output) or [repr(e2)]
-                return await fail(f"scrcpy 启动失败：{reason}\n\n换用 {retry or '默认'} 编码器后：{scrcpy_reason(output, e2)}")
-            set_encoder(serial, retry)
+                reason = scrcpy_reason(output, e)
+                failure = last_failure[serial] = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "encoder": encoder,
+                                                  "first": list(output) or [repr(e)], "reason": reason}
+                await teardown()
+                # TV SoCs often ship a hardware encoder scrcpy cannot drive; retry once with another one
+                retry, listing = ("", "") if encoder else await fallback_encoder(serial, encoder)
+                failure["encoders"] = listing.splitlines()
+                if retry or encoder:
+                    log.warning("%s: encoder %r failed (%s), retrying with %r", serial, encoder or "default", reason, retry or "default")
+                    try:
+                        started = await launch(retry, min(max_size or 1280, 1280) if retry else max_size)
+                        set_encoder(serial, retry)
+                    except Exception as e2:
+                        await collect_exit_log()
+                        failure["retry"] = retry
+                        failure["second"] = list(output) or [repr(e2)]
+                        await teardown()
+        if started is None:
+            # last resort: the device's own screenrecord (native codec) for video, scrcpy only for input
+            try:
+                started = await launch_screenrecord()
+            except Exception as e3:
+                await collect_exit_log()
+                await teardown()
+                if failure is None:
+                    failure = last_failure[serial] = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "encoder": encoder}
+                failure["screenrecord"] = list(output) + [str(e3) or repr(e3)]
+                if encoder == SCREENRECORD:
+                    set_encoder(serial, "")  # retry the normal path next time
+                head = f"scrcpy 启动失败：{failure['reason']}\n\n" if failure.get("reason") else ""
+                return await fail(f"{head}改用系统录屏也失败：{str(e3) or repr(e3)}")
+            if encoder != SCREENRECORD:
+                log.warning("%s: using screenrecord fallback", serial)
+                set_encoder(serial, SCREENRECORD)
+        if failure is not None and started is not None:
             last_failure.pop(serial, None)
+        source, cr, cw, name, (width, height), touch = started
 
-        codec = meta[:4].decode("ascii", "replace")
-        width = int.from_bytes(meta[4:8], "big")
-        height = int.from_bytes(meta[8:12], "big")
-        await ws.send_json({"type": "meta", "name": name, "codec": codec, "width": width, "height": height})
+        msg = {"type": "meta", "name": name, "codec": "h264", "width": width, "height": height}
+        if touch:
+            # scrcpy has no video to map against, so it takes raw display coordinates
+            msg.update(touchWidth=touch[0], touchHeight=touch[1], mode=SCREENRECORD)
+        await ws.send_json(msg)
 
         # the page acks every few frames ("a<count>"); OS socket buffers hide a slow viewer otherwise
         flow = {"acked": 0, "acking": False}
@@ -558,9 +796,7 @@ async def ws_stream(request):
             skipping = False
             last_reset = 0.0
             while True:
-                hdr = await vr.readexactly(12)
-                size = int.from_bytes(hdr[8:12], "big")
-                payload = await vr.readexactly(size)
+                hdr, payload = await source.next()
                 config, key = hdr[0] & 0x80, hdr[0] & 0x40
                 if not config:
                     now = loop.time()
@@ -578,7 +814,7 @@ async def ws_stream(request):
                     if skipping:
                         if not key:
                             if now - last_reset > 1:
-                                cw.write(b"\x11")  # RESET_VIDEO -> fresh config + key frame
+                                source.request_key()
                                 last_reset = now
                             continue
                         skipping = False
@@ -593,6 +829,9 @@ async def ws_stream(request):
         async def pump_control():
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
+                    if msg.data == b"\x11":  # RESET_VIDEO from the page
+                        source.request_key()
+                        continue
                     cw.write(msg.data)
                     await cw.drain()
                 elif msg.type == WSMsgType.TEXT and msg.data[:1] == "a" and msg.data[1:].isdigit():

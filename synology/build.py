@@ -20,7 +20,7 @@ ROOT = HERE.parent
 CACHE = HERE / ".cache"
 DIST = ROOT / "dist"
 
-VERSION = "1.0.4-0005"
+VERSION = "1.1.0-0006"
 PY_VER = "3.12"
 PY_URL = ("https://github.com/astral-sh/python-build-standalone/releases/download/20261003/"
           "cpython-3.12.15%2B20261003-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz")
