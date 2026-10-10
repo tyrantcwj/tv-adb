@@ -8,6 +8,7 @@ import random
 import re
 import shlex
 import tempfile
+import time
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -18,7 +19,7 @@ DATA = Path(os.environ.get("DATA_DIR", BASE / "data"))
 PORT = int(os.environ.get("PORT", "8765"))
 PASSWORD = os.environ.get("PASSWORD", "")
 ADB = os.environ.get("ADB", "adb")
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 SCRCPY_VERSION = os.environ.get("SCRCPY_VERSION", "3.3.4")
 SCRCPY_LOCAL = Path(os.environ.get("SCRCPY_SERVER", BASE / "server" / f"scrcpy-server-v{SCRCPY_VERSION}"))
 SCRCPY_REMOTE = f"/data/local/tmp/scrcpy-server-v{SCRCPY_VERSION}.jar"
@@ -130,6 +131,13 @@ def body_serial(data):
 
 async def api_devices(request):
     return web.json_response(await list_devices())
+
+
+async def api_diag(request):
+    serial = request.query.get("serial", "")
+    if serial:
+        return web.json_response(last_failure.get(serial, {}))
+    return web.json_response(last_failure)
 
 
 async def api_version(request):
@@ -322,6 +330,8 @@ async def ensure_server(serial):
 SCRCPY_CMD = f"CLASSPATH={SCRCPY_REMOTE} app_process / com.genymobile.scrcpy.Server {SCRCPY_VERSION}"
 # per-device encoder that is known to work, for devices whose default (hardware) encoder fails
 encoder_pref: dict[str, str] = {}
+# full scrcpy output of the last failed start per device, served by /api/diag for remote debugging
+last_failure: dict[str, dict] = {}
 
 
 def saved_encoder(serial):
@@ -364,10 +374,13 @@ def scrcpy_reason(output, exc):
     """The useful part of scrcpy's own log, rather than a bare socket error."""
     lines = [l.replace("[server] ", "") for l in output
              if any(k in l for k in ("ERROR", "WARN", "Exception", "Caused by", "Error:", "rror"))]
+    frames = [l.strip() for l in output if l.strip().startswith("at ")][:6]
+    if lines and frames:
+        lines = lines[-4:] + frames
     if not lines:
         # nothing tagged: show whatever scrcpy printed, minus the routine device banner
         lines = [l.replace("[server] ", "") for l in output if "INFO: Device:" not in l]
-    return "\n".join(lines[-6:]) or str(exc) or exc.__class__.__name__
+    return "\n".join(lines[-10:]) or str(exc) or exc.__class__.__name__
 
 
 def clamp_int(v, lo, hi, default):
@@ -509,9 +522,12 @@ async def ws_stream(request):
         except Exception as e:
             await collect_exit_log()
             reason = scrcpy_reason(output, e)
+            failure = last_failure[serial] = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "encoder": encoder,
+                                              "first": list(output) or [repr(e)]}
             await teardown()
             # TV SoCs often ship a hardware encoder scrcpy cannot drive; retry once with another one
             retry, listing = ("", "") if encoder else await fallback_encoder(serial, encoder)
+            failure["encoders"] = listing.splitlines()
             if not retry and not encoder:
                 listing = "\n".join(l.strip() for l in listing.splitlines() if "video-encoder" in l or "rror" in l)
                 return await fail(f"scrcpy 启动失败：{reason}\n\n没有可换的 H.264 编码器" + (f"：\n{listing}" if listing else ""))
@@ -521,8 +537,11 @@ async def ws_stream(request):
                 vr, cr, cw, name, meta = await launch(retry, size)
             except Exception as e2:
                 await collect_exit_log()
+                failure["retry"] = retry
+                failure["second"] = list(output) or [repr(e2)]
                 return await fail(f"scrcpy 启动失败：{reason}\n\n换用 {retry or '默认'} 编码器后：{scrcpy_reason(output, e2)}")
             set_encoder(serial, retry)
+            last_failure.pop(serial, None)
 
         codec = meta[:4].decode("ascii", "replace")
         width = int.from_bytes(meta[4:8], "big")
@@ -643,6 +662,7 @@ def make_app():
     app.router.add_get("/", index)
     app.router.add_get("/api/devices", api_devices)
     app.router.add_get("/api/version", api_version)
+    app.router.add_get("/api/diag", api_diag)
     app.router.add_post("/api/connect", api_connect)
     app.router.add_post("/api/save", api_save)
     app.router.add_post("/api/disconnect", api_disconnect)
