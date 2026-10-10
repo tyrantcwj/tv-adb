@@ -18,6 +18,7 @@ DATA = Path(os.environ.get("DATA_DIR", BASE / "data"))
 PORT = int(os.environ.get("PORT", "8765"))
 PASSWORD = os.environ.get("PASSWORD", "")
 ADB = os.environ.get("ADB", "adb")
+APP_VERSION = "1.0.3"
 SCRCPY_VERSION = os.environ.get("SCRCPY_VERSION", "3.3.4")
 SCRCPY_LOCAL = Path(os.environ.get("SCRCPY_SERVER", BASE / "server" / f"scrcpy-server-v{SCRCPY_VERSION}"))
 SCRCPY_REMOTE = f"/data/local/tmp/scrcpy-server-v{SCRCPY_VERSION}.jar"
@@ -129,6 +130,10 @@ def body_serial(data):
 
 async def api_devices(request):
     return web.json_response(await list_devices())
+
+
+async def api_version(request):
+    return web.json_response({"version": APP_VERSION, "scrcpy": SCRCPY_VERSION})
 
 
 async def api_connect(request):
@@ -341,23 +346,28 @@ ENCODER_RE = re.compile(r"--video-codec=h264 --video-encoder=(\S+)(?:[ \t]+\((\w
 
 
 async def fallback_encoder(serial, failed):
-    """Pick another H.264 encoder, preferring the platform software one."""
+    """Pick another H.264 encoder, preferring the platform software one.
+    Returns (encoder or "", raw scrcpy output for diagnostics)."""
     rc, out = await adb_text("-s", serial, "shell", f"{SCRCPY_CMD} list_encoders=true log_level=info", timeout=20)
+    log.info("[%s] encoders:\n%s", serial, out)
     # before Android 10 scrcpy prints no (sw)/(hw) tag; Google's encoders are the software ones
     found = [(name, kind or ("sw" if re.search(r"google|c2\.android", name, re.I) else "hw"))
              for name, kind in ENCODER_RE.findall(out)]
     for want in ("sw", "hw"):
         for name, kind in found:
             if kind == want and name != failed:
-                return name
-    return ""
+                return name, out
+    return "", out
 
 
 def scrcpy_reason(output, exc):
     """The useful part of scrcpy's own log, rather than a bare socket error."""
     lines = [l.replace("[server] ", "") for l in output
-             if any(k in l for k in ("ERROR", "WARN", "Exception", "Caused by", "Error:"))]
-    return "\n".join(lines[-4:]) or str(exc) or exc.__class__.__name__
+             if any(k in l for k in ("ERROR", "WARN", "Exception", "Caused by", "Error:", "rror"))]
+    if not lines:
+        # nothing tagged: show whatever scrcpy printed, minus the routine device banner
+        lines = [l.replace("[server] ", "") for l in output if "INFO: Device:" not in l]
+    return "\n".join(lines[-6:]) or str(exc) or exc.__class__.__name__
 
 
 def clamp_int(v, lo, hi, default):
@@ -387,7 +397,7 @@ async def ws_stream(request):
     bit_rate = clamp_int(request.query.get("bit_rate"), 200_000, 50_000_000, 4_000_000)
     max_fps = clamp_int(request.query.get("max_fps"), 1, 120, 30)
 
-    live_state = {"proc": None, "port": None}
+    live_state = {"proc": None, "port": None, "reader": None}
     writers = []
     tasks = []
     output = collections.deque(maxlen=40)
@@ -418,6 +428,20 @@ async def ws_stream(request):
             await adb_text("-s", serial, "forward", "--remove", f"tcp:{live_state['port']}")
             live_state["port"] = None
 
+    async def collect_exit_log():
+        """The video socket drops the moment scrcpy dies, before its stderr has been read."""
+        proc, reader = live_state["proc"], live_state["reader"]
+        if proc:
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                pass
+        if reader:
+            try:
+                await asyncio.wait_for(asyncio.shield(reader), 2)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
     async def launch(encoder, size):
         output.clear()
         scid = "%08x" % random.getrandbits(31)
@@ -439,7 +463,8 @@ async def ws_stream(request):
                 output.append(text)
                 log.info("[%s] %s", serial, text)
 
-        tasks.append(asyncio.create_task(read_output()))
+        live_state["reader"] = asyncio.create_task(read_output())
+        tasks.append(live_state["reader"])
 
         async def open_socket(first):
             loop = asyncio.get_running_loop()
@@ -482,17 +507,20 @@ async def ws_stream(request):
             # a remembered fallback encoder is usually the software one, which can't keep up above 720p
             vr, cr, cw, name, meta = await launch(encoder, min(max_size or 1280, 1280) if encoder else max_size)
         except Exception as e:
+            await collect_exit_log()
             reason = scrcpy_reason(output, e)
             await teardown()
             # TV SoCs often ship a hardware encoder scrcpy cannot drive; retry once with another one
-            retry = "" if encoder else await fallback_encoder(serial, encoder)
+            retry, listing = ("", "") if encoder else await fallback_encoder(serial, encoder)
             if not retry and not encoder:
-                return await fail(f"scrcpy 启动失败：{reason}")
+                listing = "\n".join(l.strip() for l in listing.splitlines() if "video-encoder" in l or "rror" in l)
+                return await fail(f"scrcpy 启动失败：{reason}\n\n没有可换的 H.264 编码器" + (f"：\n{listing}" if listing else ""))
             log.warning("%s: encoder %r failed (%s), retrying with %r", serial, encoder or "default", reason, retry or "default")
             size = min(max_size or 1280, 1280) if retry else max_size  # software encoders are slow
             try:
                 vr, cr, cw, name, meta = await launch(retry, size)
             except Exception as e2:
+                await collect_exit_log()
                 return await fail(f"scrcpy 启动失败：{reason}\n\n换用 {retry or '默认'} 编码器后：{scrcpy_reason(output, e2)}")
             set_encoder(serial, retry)
 
@@ -614,6 +642,7 @@ def make_app():
     app = web.Application(middlewares=[auth_middleware], client_max_size=1 << 31)
     app.router.add_get("/", index)
     app.router.add_get("/api/devices", api_devices)
+    app.router.add_get("/api/version", api_version)
     app.router.add_post("/api/connect", api_connect)
     app.router.add_post("/api/save", api_save)
     app.router.add_post("/api/disconnect", api_disconnect)
